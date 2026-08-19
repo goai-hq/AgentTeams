@@ -839,7 +839,10 @@ func (r *TeamReconciler) detachTeamMember(ctx context.Context, t *v1beta1.Team, 
 	managerMatrixID := r.ManagerConfig.MatrixUserID("manager")
 	if w.Status.RoomID != "" {
 		if err := r.Provisioner.InviteToRoom(ctx, w.Status.RoomID, managerMatrixID); err != nil {
-			return fmt.Errorf("restore Manager to Worker %q personal room: %w", w.Name, err)
+			// The worker may already have the Manager as a member. Matrix reports
+			// that idempotent condition as a 403, which must not strand a Team
+			// deletion behind its finalizer.
+			logger.Error(err, "failed to restore Manager to standalone Worker room (non-fatal)", "worker", w.Name)
 		}
 	}
 	if runtime == backend.RuntimeQwenPaw {

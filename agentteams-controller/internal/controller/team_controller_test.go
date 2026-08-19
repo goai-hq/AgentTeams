@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -467,9 +468,9 @@ func TestReconcileTeamTeamReferences_QwenPawProjectsRuntimeRoster(t *testing.T) 
 	team := &v1beta1.Team{
 		ObjectMeta: metav1.ObjectMeta{Name: "team-a", Namespace: "default"},
 		Spec: v1beta1.TeamSpec{
-			Admin:        &v1beta1.TeamAdminSpec{Name: "admin", MatrixUserID: "@admin:localhost"},
+			Admin:         &v1beta1.TeamAdminSpec{Name: "admin", MatrixUserID: "@admin:localhost"},
 			ChannelPolicy: &v1beta1.ChannelPolicySpec{GroupAllowExtra: []string{"team-group-bot"}},
-			HumanMembers: []v1beta1.TeamMemberSpec{{Name: "human-coord", MatrixUserID: "@human:matrix.local"}},
+			HumanMembers:  []v1beta1.TeamMemberSpec{{Name: "human-coord", MatrixUserID: "@human:matrix.local"}},
 			WorkerMembers: []v1beta1.TeamWorkerRef{
 				{Name: "lead", Role: "team_leader"},
 				{Name: "dev"},
@@ -1244,6 +1245,9 @@ func TestHandleDeleteTeamReferencesResetsChannelPolicyAndArchivesRoomsWithTeamAd
 
 	deployer := mocks.NewMockDeployer()
 	provisioner := mocks.NewMockProvisioner()
+	provisioner.InviteToRoomFn = func(context.Context, string, string) error {
+		return errors.New("matrix member is already joined")
+	}
 	r := &TeamReconciler{
 		Client:        newTeamTestClient(t, team.DeepCopy(), leaderWorker.DeepCopy(), worker.DeepCopy(), admin.DeepCopy()),
 		Provisioner:   provisioner,
@@ -1252,7 +1256,7 @@ func TestHandleDeleteTeamReferencesResetsChannelPolicyAndArchivesRoomsWithTeamAd
 	}
 
 	if err := r.handleDeleteTeam(ctx, team); err != nil {
-		t.Fatalf("handleDeleteTeam: %v", err)
+		t.Fatalf("handleDeleteTeam() must continue when Manager room restore fails: %v", err)
 	}
 
 	policies := map[string]service.InjectChannelPolicyRequest{}

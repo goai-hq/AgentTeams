@@ -27,6 +27,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/matrix"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/google/uuid"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -76,9 +77,20 @@ type projectMeta struct {
 	// human-intervention audit fields (written by the lifecycle write API;
 	// tolerated by json.Unmarshal when absent, and passed through here so
 	// consumers can show who paused/resumed and why).
-	UpdatedBy   string `json:"updated_by,omitempty"`
-	UpdatedAt   string `json:"updated_at,omitempty"`
-	PauseReason string `json:"pause_reason,omitempty"`
+	UpdatedBy       string           `json:"updated_by,omitempty"`
+	UpdatedAt       string           `json:"updated_at,omitempty"`
+	PauseReason     string           `json:"pause_reason,omitempty"`
+	DispatchIntents []dispatchIntent `json:"dispatch_intents,omitempty"`
+}
+
+// dispatchIntent is a durable controller-to-TeamHarness handoff. It records
+// acceptance, not Worker completion; TeamHarness remains responsible for the
+// atomic delegate_task lifecycle and will publish the eventual task state.
+type dispatchIntent struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	TaskID         string `json:"task_id"`
+	Instruction    string `json:"instruction"`
+	AcceptedAt     string `json:"accepted_at,omitempty"`
 }
 
 type projectTaskMeta struct {
@@ -2190,6 +2202,126 @@ func normalizeReplanTasks(raw []json.RawMessage, previous map[string]projectTask
 		})
 	}
 	return out, nil
+}
+
+// DispatchIntent accepts an external, idempotent request for the Team Leader
+// to delegate an already-planned task. The Controller deliberately does not
+// mark the task assigned: only TeamHarness delegate_task can atomically
+// publish the spec, notify the worker, and commit the assigned state.
+//
+// POST /api/v1/projects/{id}/dispatch-intents
+// Idempotency-Key: stable external dispatch key
+// body: {"taskId":"...","instruction":"..."}
+func (h *ProjectHandler) DispatchIntent(w http.ResponseWriter, r *http.Request) {
+	pwc, failed := h.readProjectWriteContext(w, r)
+	if failed {
+		return
+	}
+	if pwc.team == "" {
+		writeError(w, http.StatusConflict, "dispatch intent requires a team-scoped project")
+		return
+	}
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if !isDispatchIdempotencyKey(key) {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key contains unsupported characters")
+		return
+	}
+	var body struct {
+		TaskID      string `json:"taskId"`
+		Instruction string `json:"instruction"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	body.TaskID = strings.TrimSpace(body.TaskID)
+	if !isPlainToken(body.TaskID) || strings.TrimSpace(body.Instruction) == "" {
+		writeError(w, http.StatusBadRequest, "taskId and instruction are required")
+		return
+	}
+
+	var task *projectTaskMeta
+	for i := range pwc.meta.Tasks {
+		if pwc.meta.Tasks[i].TaskID == body.TaskID {
+			task = &pwc.meta.Tasks[i]
+			break
+		}
+	}
+	if task == nil {
+		writeError(w, http.StatusNotFound, "planned task not found")
+		return
+	}
+	if task.Status != "planned" {
+		writeError(w, http.StatusConflict, "dispatch intent requires a planned task")
+		return
+	}
+	for _, intent := range pwc.meta.DispatchIntents {
+		if intent.IdempotencyKey == key {
+			if intent.TaskID != body.TaskID || intent.Instruction != body.Instruction {
+				writeError(w, http.StatusConflict, "Idempotency-Key was already used for a different dispatch intent")
+				return
+			}
+			httputil.WriteJSON(w, http.StatusOK, map[string]any{
+				"status": "accepted", "project_id": pwc.meta.ProjectID, "task_id": body.TaskID,
+				"team_id": pwc.team, "room_id": teamRoomID(r.Context(), h.client, h.namespace, pwc.team),
+			})
+			return
+		}
+	}
+
+	var team v1beta1.Team
+	if err := h.client.Get(r.Context(), types.NamespacedName{Name: pwc.team, Namespace: h.namespace}, &team); err != nil {
+		writeK8sError(w, "read dispatch team", err)
+		return
+	}
+	roomID := strings.TrimSpace(team.Status.TeamRoomID)
+	if roomID == "" || !team.Status.LeaderReady {
+		writeError(w, http.StatusConflict, "team leader room is not ready")
+		return
+	}
+	if h.matrix == nil {
+		writeError(w, http.StatusServiceUnavailable, "matrix delivery is unavailable")
+		return
+	}
+
+	message := fmt.Sprintf("RepoOps dispatch intent %s for task %s. Use TeamHarness taskflow.delegate_task for this planned task.\n\n%s", key, body.TaskID, strings.TrimSpace(body.Instruction))
+	if err := h.matrix.SendMessageAsAdmin(r.Context(), roomID, message); err != nil {
+		writeError(w, http.StatusBadGateway, "dispatch intent delivery failed")
+		return
+	}
+	pwc.meta.DispatchIntents = append(pwc.meta.DispatchIntents, dispatchIntent{
+		IdempotencyKey: key, TaskID: body.TaskID, Instruction: body.Instruction, AcceptedAt: utcTimestamp(),
+	})
+	markAuditFields(pwc.meta, authzActor(authpkg.CallerFromContext(r.Context())), "repoops dispatch accepted")
+	if !h.writeProjectMeta(r.Context(), w, pwc.key, pwc.meta, pwc.etag) {
+		return
+	}
+	httputil.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"status": "accepted", "project_id": pwc.meta.ProjectID, "task_id": body.TaskID,
+		"team_id": pwc.team, "room_id": roomID,
+	})
+}
+
+func teamRoomID(ctx context.Context, k8s client.Client, namespace, teamName string) string {
+	var team v1beta1.Team
+	if err := k8s.Get(ctx, types.NamespacedName{Name: teamName, Namespace: namespace}, &team); err != nil {
+		return ""
+	}
+	return team.Status.TeamRoomID
+}
+
+func isDispatchIdempotencyKey(value string) bool {
+	if value == "" || len(value) > 256 {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // validateTaskGraph mirrors TeamHarness _validate_task_graph: rejects

@@ -450,6 +450,17 @@ func TestHTTPServer_RegistersProjectRoutes(t *testing.T) {
 		t.Fatalf("expected p1 in workflow, got %s", rec2.Body.String())
 	}
 
+	// POST dispatch-intents is registered. This standalone project has no Team
+	// binding, so the handler rejects it semantically instead of falling through
+	// to an unmatched-route 404.
+	reqDispatch := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/dispatch-intents", strings.NewReader(`{"taskId":"t1","instruction":"run"}`))
+	reqDispatch.Header.Set("Idempotency-Key", "dispatch-1")
+	recDispatch := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(recDispatch, reqDispatch)
+	if recDispatch.Code != http.StatusConflict {
+		t.Fatalf("POST dispatch intent status=%d body=%s, want 409", recDispatch.Code, recDispatch.Body.String())
+	}
+
 	// GET /api/v1/projects/p1/tasks/t1/artifact (route registered; no task
 	// meta/artifact stored → 404 rather than 405/404-for-unmatched)
 	putProject(store, "shared/tasks/t1/meta.json", map[string]any{

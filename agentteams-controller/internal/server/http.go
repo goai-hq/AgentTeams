@@ -129,6 +129,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("POST /api/v1/projects/{id}/pause", mw.RequireAuthz(authpkg.ActionUpdate, "project", projectNameFn)(http.HandlerFunc(projh.PauseProject)))
 	mux.Handle("POST /api/v1/projects/{id}/resume", mw.RequireAuthz(authpkg.ActionUpdate, "project", projectNameFn)(http.HandlerFunc(projh.ResumeProject)))
 	mux.Handle("POST /api/v1/projects/{id}/replan", mw.RequireAuthz(authpkg.ActionUpdate, "project", projectNameFn)(http.HandlerFunc(projh.ReplanProject)))
+	mux.Handle("POST /api/v1/projects/{id}/dispatch-intents", mw.RequireAuthz(authpkg.ActionUpdate, "project", projectNameFn)(http.HandlerFunc(projh.DispatchIntent)))
 	mux.Handle("POST /api/v1/projects/{id}/tasks/{taskId}/cancel", mw.RequireAuthz(authpkg.ActionUpdate, "project", projectTaskNameFn)(http.HandlerFunc(projh.CancelTask)))
 	mux.Handle("POST /api/v1/projects/{id}/complete", mw.RequireAuthz(authpkg.ActionUpdate, "project", projectNameFn)(http.HandlerFunc(projh.CompleteProject)))
 
